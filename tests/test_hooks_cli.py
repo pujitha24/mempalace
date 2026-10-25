@@ -819,6 +819,58 @@ def test_checkpoint_child_waits_out_a_held_palace_lock(tmp_path):
     assert (tmp_path / "s_last_save").read_text(encoding="utf-8") == "15"
 
 
+def test_checkpoint_child_takes_writer_lease_on_single_writer_backend(tmp_path):
+    order = []
+    with (
+        patch.object(hooks_cli_mod, "STATE_DIR", tmp_path),
+        patch("mempalace.palace.backend_requires_single_writer", return_value=True),
+        patch(
+            "mempalace.mcp_server._acquire_mcp_writer_lock",
+            side_effect=lambda: order.append("lease") or (True, ""),
+        ) as lease,
+        patch(
+            "mempalace.mcp_server._release_mcp_writer_lock",
+            side_effect=lambda: order.append("release"),
+        ),
+        patch(
+            "mempalace.mcp_server.tool_diary_write",
+            side_effect=lambda **kw: order.append("write") or {"success": True, "entry_id": "e"},
+        ),
+    ):
+        assert hooks_cli_mod._apply_diary_checkpoint({"entry": "CHECKPOINT:x"}) is True
+    lease.assert_called_once()
+    # Released right after the write so the queued mines can take the palace lock.
+    assert order == ["lease", "write", "release"]
+
+
+def test_checkpoint_child_skips_writer_lease_on_chroma(tmp_path):
+    with (
+        patch.object(hooks_cli_mod, "STATE_DIR", tmp_path),
+        patch("mempalace.palace.backend_requires_single_writer", return_value=False),
+        patch("mempalace.mcp_server._acquire_mcp_writer_lock") as lease,
+        patch("mempalace.mcp_server.tool_diary_write", return_value={"success": True}),
+    ):
+        assert hooks_cli_mod._apply_diary_checkpoint({"entry": "CHECKPOINT:x"}) is True
+    lease.assert_not_called()
+
+
+def test_checkpoint_child_retries_while_a_peer_holds_the_writer_lease(tmp_path):
+    with (
+        patch.object(hooks_cli_mod, "STATE_DIR", tmp_path),
+        patch("mempalace.palace.backend_requires_single_writer", return_value=True),
+        patch(
+            "mempalace.mcp_server._acquire_mcp_writer_lock",
+            side_effect=[(False, "peer"), (True, "")],
+        ),
+        patch("mempalace.mcp_server._MCP_WRITER_READ_ONLY", True),
+        patch("mempalace.mcp_server.tool_diary_write", return_value={"success": True}) as w,
+        patch("mempalace.hooks_cli.time.sleep") as sleep,
+    ):
+        assert hooks_cli_mod._apply_diary_checkpoint({"entry": "CHECKPOINT:x"}) is True
+    assert sleep.call_count == 1
+    w.assert_called_once()
+
+
 def test_daemon_available_probe_stays_under_hook_budget(tmp_path, monkeypatch):
     import socket
     import threading

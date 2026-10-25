@@ -1047,27 +1047,58 @@ def run_detached_diary_checkpoint(payload_path: str) -> None:
         _maybe_auto_ingest()
 
 
-def _apply_diary_checkpoint(payload: dict) -> bool:
-    """File the checkpoint and write its ack. Only the child imports mcp_server."""
+def _write_checkpoint_entry(mcp_server, tool_diary_write, payload, entry, needs_lease) -> dict:
+    """Write the checkpoint, retrying while another process holds the palace lock."""
     from .daemon import LOCK_REFUSAL_ERROR_CLASS
-    from .mcp_server import tool_diary_write
 
-    entry = payload.get("entry")
-    if not isinstance(entry, str) or not entry:
-        return False
     for delay in _DIARY_LOCK_RETRY_DELAYS + (None,):
-        result = tool_diary_write(
-            agent_name=str(payload.get("agent_name") or "claude"),
-            entry=entry,
-            topic=str(payload.get("topic") or "checkpoint"),
-            wing=str(payload.get("wing") or ""),
+        # Calling tool_diary_write in-process skips the writer lease a tools/call
+        # takes, so a single-writer backend (sqlite_exact) would open read-only.
+        lease_ok, lease_reason = (
+            mcp_server._acquire_mcp_writer_lock() if needs_lease else (True, "")
         )
+        if lease_ok:
+            result = tool_diary_write(
+                agent_name=str(payload.get("agent_name") or "claude"),
+                entry=entry,
+                topic=str(payload.get("topic") or "checkpoint"),
+                wing=str(payload.get("wing") or ""),
+            )
+        else:
+            result = {"success": False, "error": lease_reason}
+            if mcp_server._MCP_WRITER_READ_ONLY:
+                result["error_class"] = LOCK_REFUSAL_ERROR_CLASS
         if not isinstance(result, dict):
             result = {}
         if result.get("success") or result.get("error_class") != LOCK_REFUSAL_ERROR_CLASS:
             break
         if delay is not None:
             time.sleep(delay)
+    return result
+
+
+def _apply_diary_checkpoint(payload: dict) -> bool:
+    """File the checkpoint and write its ack. Only the child imports mcp_server."""
+    from . import mcp_server
+    from .mcp_server import tool_diary_write
+    from .palace import backend_requires_single_writer, resolve_backend_name
+
+    entry = payload.get("entry")
+    if not isinstance(entry, str) or not entry:
+        return False
+    try:
+        needs_lease = backend_requires_single_writer(
+            resolve_backend_name(MempalaceConfig().palace_path)
+        )
+    except Exception:
+        needs_lease = False
+    try:
+        result = _write_checkpoint_entry(mcp_server, tool_diary_write, payload, entry, needs_lease)
+    finally:
+        if needs_lease:
+            # The mines queued after this write run as separate processes and
+            # need the palace lock; do not hold it until this child exits.
+            mcp_server._release_mcp_writer_lock()
     if not result.get("success"):
         # The save marker stays put, so the next Stop files a fresh checkpoint.
         _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
